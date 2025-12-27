@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import os
 from collections.abc import Iterable
-from pickle import TRUE
+from pickle import NONE, TRUE
 from typing import IO, Any, BinaryIO
 
 import numpy.typing as npt
@@ -35,6 +35,25 @@ def run_linear(
     return in_features @ weights.T
 
 
+class Embedding(torch.nn.Module):
+    def __init__(
+        self,
+        vocab_size: int,
+        d_model: int,
+        weights: Float[Tensor, " vocab_size d_model"],
+        device: torch.device | None = None,
+        dtype: torch.types | None = None,
+    ):
+        super().__init__()
+        self.embdding_matrix_ = torch.nn.Parameter(weights)
+        # TODO: trunc_normal_ need to provide mean and std
+        self.vocab_size_ = vocab_size
+        self.d_model_ = d_model
+
+    def forward(self, token_ids: Int[Tensor, " ..."]):
+        return self.embdding_matrix_[token_ids]
+
+
 def run_embedding(
     vocab_size: int,
     d_model: int,
@@ -53,11 +72,41 @@ def run_embedding(
     Returns:
         Float[Tensor, "... d_model"]: Batch of embeddings returned by your Embedding layer.
     """
+    emd = Embedding(vocab_size, d_model, weights)
+    return emd.forward(token_ids)
 
-    raise NotImplementedError
+
+class SwiGLU(torch.nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        d_ff: int,
+        w1_weight: Float[Tensor, " d_ff d_model"],
+        w2_weight: Float[Tensor, " d_model d_ff"],
+        w3_weight: Float[Tensor, " d_ff d_model"],
+        device: torch.device | None = None,
+        dtype: torch.types | None = None,
+    ) -> None:
+        super().__init__()
+        self.d_model_ = d_model
+        self.d_ff_ = d_ff
+        assert(w1_weight.shape == (d_ff, d_model))
+        assert(w2_weight.shape == (d_model, d_ff))
+        assert(w3_weight.shape == (d_ff, d_model))
+        self.w1_weight_ = torch.nn.Parameter(w1_weight)
+        self.w2_weight_ = torch.nn.Parameter(w2_weight)
+        self.w3_weight_ = torch.nn.Parameter(w3_weight)
+
+    def forward(self, in_features):
+        # in_features [...d_model]
+        assert(in_features.shape[-1] == self.d_model_)
+        w1_x = in_features @ self.w1_weight_.T # [...d_ff]
+        silu_w1_x = w1_x * torch.sigmoid(w1_x) # [...d_ff]
+        w3_x = in_features @ self.w3_weight_.T # [...d_ff]
+        return  (silu_w1_x * w3_x) @self.w2_weight_.T
 
 
-# TODO: define swiglu as nn.Module
+
 def run_swiglu(
     d_model: int,
     d_ff: int,
@@ -87,7 +136,8 @@ def run_swiglu(
     # swiglu.w1.weight.data = w1_weight
     # swiglu.w2.weight.data = w2_weight
     # swiglu.w3.weight.data = w3_weight
-    raise NotImplementedError
+    swiglu = SwiGLU(d_model, d_ff, w1_weight, w2_weight, w3_weight)
+    return swiglu(in_features)
 
 
 def run_scaled_dot_product_attention(
@@ -362,6 +412,33 @@ def run_transformer_lm(
     raise NotImplementedError
 
 
+class RMSNorm(torch.nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        eps: float,
+        weights: Float[Tensor, " d_model"],
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ):
+        super().__init__()
+        self.d_model_ = d_model
+        self.eps_ = eps
+        self.weights_ = torch.nn.Parameter(weights)
+
+    def forward(
+        self,
+        in_features: Float[Tensor, " ... d_model"],
+    ):
+        assert in_features.shape[-1] == self.d_model_
+        in_type = in_features.dtype
+        in_features = in_features.to(torch.float32)
+        in_features_sum = torch.sum(in_features**2, dim=-1)  # [...,]
+        rms = torch.sqrt(in_features_sum / self.d_model_ + self.eps_)
+        rms = rms.unsqueeze(-1)
+        return (in_features / rms * self.weights_).to(in_type)
+
+
 def run_rmsnorm(
     d_model: int,
     eps: float,
@@ -382,13 +459,15 @@ def run_rmsnorm(
         Float[Tensor,"... d_model"]: Tensor of with the same shape as `in_features` with the output of running
         RMSNorm of the `in_features`.
     """
-    raise NotImplementedError
+    rmsnorm = RMSNorm(d_model, eps, weights)
+    return rmsnorm.forward(in_features)
 
 
 def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
     """Given a tensor of inputs, return the output of applying SiLU
     to each element.
 
+    silu = x / (1 + e(-x))
     Args:
         in_features(Float[Tensor, "..."]): Input features to run SiLU on. Shape is arbitrary.
 
@@ -396,7 +475,7 @@ def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
         Float[Tensor,"..."]: of with the same shape as `in_features` with the output of applying
         SiLU to each element.
     """
-    raise NotImplementedError
+    return in_features / ( 1 + torch.exp(-in_features))
 
 
 def run_get_batch(
@@ -444,7 +523,6 @@ def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, "
     return exponential_features / sum_of_exponential_features
 
 
-
 def run_cross_entropy(
     inputs: Float[Tensor, " batch_size vocab_size"], targets: Int[Tensor, " batch_size"]
 ) -> Float[Tensor, ""]:
@@ -453,11 +531,11 @@ def run_cross_entropy(
 
     This way: the softmax could return 0 and log could return inf, but we can avoid this by using the log_softmax.
        1. compute the softmax of the inputs.
-       2. pick the softmax value based on target class for each example. 
+       2. pick the softmax value based on target class for each example.
        For example, if the target is 0, then the softmax value is the 1rd value in the softmax vector.
        3. cross-entropy loss is -log(picked softmax value).
        4. compute the average of the cross-entropy losses.
-    
+
     z = inputs or named as logits
     z = z - max(z)
     log_softmax_i =  Z_i - log(sum(exp(z)))
@@ -475,18 +553,16 @@ def run_cross_entropy(
     max_values = inputs.max(dim=-1).values
     inputs = inputs - max_values.unsqueeze(-1)
     log_sum_exp = torch.log(torch.sum(torch.exp(inputs), dim=-1))  # shape: (batch_size,)
-    
+
     # Broadcast log_sum_exp to match inputs shape: (batch_size,) -> (batch_size, 1)
     log_softmax = inputs - log_sum_exp.unsqueeze(-1)  # shape: (batch_size, vocab_size)
-    
+
     # Select log_softmax values for the target classes using advanced indexing
     batch_indices = torch.arange(targets.shape[0], device=inputs.device)
     selected_log_probs = log_softmax[batch_indices, targets]  # shape: (batch_size,)
-    
+
     # Cross-entropy loss is negative log probability, then average
     return -selected_log_probs.mean()
-
-
 
 
 def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float) -> None:
@@ -501,9 +577,9 @@ def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm:
 
     The gradients of the parameters (parameter.grad) should be modified in-place.
     """
-    
+
     grads = [p.grad for p in parameters if p.grad is not None]
-    total_norm = torch.sqrt(sum(g.norm()**2 for g in grads))
+    total_norm = torch.sqrt(sum(g.norm() ** 2 for g in grads))
     clip_coef = max_l2_norm / total_norm
     # mul_ is in-place multiplication while * will create a new tensor and g's grad will be lost
     for g in grads:
@@ -551,7 +627,7 @@ def run_get_lr_cosine_schedule(
         # Linear warmup from 0 to max_learning_rate
         return max_learning_rate * it / warmup_iters
     else:
-        progress = min(1.0, (it - warmup_iters) / (cosine_cycle_iters  -  warmup_iters))
+        progress = min(1.0, (it - warmup_iters) / (cosine_cycle_iters - warmup_iters))
         return min_learning_rate + 0.5 * (max_learning_rate - min_learning_rate) * (1 + math.cos(math.pi * progress))
 
 
