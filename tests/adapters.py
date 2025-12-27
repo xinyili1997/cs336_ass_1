@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import math
 import os
 from collections.abc import Iterable
+from pickle import TRUE
 from typing import IO, Any, BinaryIO
 
 import numpy.typing as npt
 import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
+from torch.nn.functional import cross_entropy
 
 
 def run_linear(
@@ -28,8 +31,8 @@ def run_linear(
     Returns:
         Float[Tensor, "... d_out"]: The transformed output of your linear module.
     """
-
-    raise NotImplementedError
+    del d_in, d_out
+    return in_features @ weights.T
 
 
 def run_embedding(
@@ -54,6 +57,7 @@ def run_embedding(
     raise NotImplementedError
 
 
+# TODO: define swiglu as nn.Module
 def run_swiglu(
     d_model: int,
     d_ff: int,
@@ -300,7 +304,7 @@ def run_transformer_lm(
         num_heads (int): Number of heads to use in multi-headed attention. `d_model` must be
             evenly divisible by `num_heads`.
         d_ff (int): Dimensionality of the feed-forward inner layer (section 3.3).
-        rope_theta (float): The RoPE $\Theta$ parameter.
+        rope_theta (float): The RoPE $\\Theta$ parameter.
         weights (dict[str, Tensor]):
             State dict of our reference implementation. {num_layers} refers to an
             integer between `0` and `num_layers - 1` (the layer index).
@@ -423,6 +427,8 @@ def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, "
     Given a tensor of inputs, return the output of softmaxing the given `dim`
     of the input.
 
+    output = exp(x[i] - max_val) / sum(exp(x[i] - max_val) for i in range(x.shape[dim]))
+
     Args:
         in_features (Float[Tensor, "..."]): Input features to softmax. Shape is arbitrary.
         dim (int): Dimension of the `in_features` to apply softmax to.
@@ -431,7 +437,12 @@ def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, "
         Float[Tensor, "..."]: Tensor of with the same shape as `in_features` with the output of
         softmax normalizing the specified `dim`.
     """
-    raise NotImplementedError
+    max_val = in_features.max(dim=dim, keepdim=True).values
+    calibrated_features = in_features - max_val
+    exponential_features = torch.exp(calibrated_features)
+    sum_of_exponential_features = exponential_features.sum(dim=dim, keepdim=True)
+    return exponential_features / sum_of_exponential_features
+
 
 
 def run_cross_entropy(
@@ -440,6 +451,17 @@ def run_cross_entropy(
     """Given a tensor of inputs and targets, compute the average cross-entropy
     loss across examples.
 
+    This way: the softmax could return 0 and log could return inf, but we can avoid this by using the log_softmax.
+       1. compute the softmax of the inputs.
+       2. pick the softmax value based on target class for each example. 
+       For example, if the target is 0, then the softmax value is the 1rd value in the softmax vector.
+       3. cross-entropy loss is -log(picked softmax value).
+       4. compute the average of the cross-entropy losses.
+    
+    z = inputs or named as logits
+    z = z - max(z)
+    log_softmax_i =  Z_i - log(sum(exp(z)))
+    loss = -log_softmax_i[target]
     Args:
         inputs (Float[Tensor, "batch_size vocab_size"]): inputs[i][j] is the
             unnormalized logit of jth class for the ith example.
@@ -449,26 +471,51 @@ def run_cross_entropy(
     Returns:
         Float[Tensor, ""]: The average cross-entropy loss across examples.
     """
-    raise NotImplementedError
+    # Compute log-sum-exp for numerical stability
+    max_values = inputs.max(dim=-1).values
+    inputs = inputs - max_values.unsqueeze(-1)
+    log_sum_exp = torch.log(torch.sum(torch.exp(inputs), dim=-1))  # shape: (batch_size,)
+    
+    # Broadcast log_sum_exp to match inputs shape: (batch_size,) -> (batch_size, 1)
+    log_softmax = inputs - log_sum_exp.unsqueeze(-1)  # shape: (batch_size, vocab_size)
+    
+    # Select log_softmax values for the target classes using advanced indexing
+    batch_indices = torch.arange(targets.shape[0], device=inputs.device)
+    selected_log_probs = log_softmax[batch_indices, targets]  # shape: (batch_size,)
+    
+    # Cross-entropy loss is negative log probability, then average
+    return -selected_log_probs.mean()
+
+
 
 
 def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float) -> None:
     """Given a set of parameters, clip their combined gradients to have l2 norm at most max_l2_norm.
 
+    1. Compute the total_norm of the parameters.
+    2. Compute clip_coef = max_l2_norm / total_norm.
+    3. Return clip_coef * parameter.grad.
     Args:
         parameters (Iterable[torch.nn.Parameter]): collection of trainable parameters.
         max_l2_norm (float): a positive value containing the maximum l2-norm.
 
     The gradients of the parameters (parameter.grad) should be modified in-place.
     """
-    raise NotImplementedError
+    
+    grads = [p.grad for p in parameters if p.grad is not None]
+    total_norm = torch.sqrt(sum(g.norm()**2 for g in grads))
+    clip_coef = max_l2_norm / total_norm
+    # mul_ is in-place multiplication while * will create a new tensor and g's grad will be lost
+    for g in grads:
+        g.mul_(clip_coef)
 
 
+# TODO: rewrite
 def get_adamw_cls() -> Any:
     """
     Returns a torch.optim.Optimizer that implements AdamW.
     """
-    raise NotImplementedError
+    return torch.optim.AdamW
 
 
 def run_get_lr_cosine_schedule(
@@ -483,6 +530,10 @@ def run_get_lr_cosine_schedule(
     warmup) and an iteration number, return the learning rate at the given
     iteration under the specified schedule.
 
+    t < warm_up:
+        lr = max_learning_rate * t / T_w --> linear decrease
+    t > = warm_up:
+        lr = min_learning_rate + 0.5 * (max_lr - min_lr) * ( 1 + cos(pi * (t-Tw) / T_c))
     Args:
         it (int): Iteration number to get learning rate for.
         max_learning_rate (float): alpha_max, the maximum learning rate for
@@ -491,12 +542,17 @@ def run_get_lr_cosine_schedule(
             the cosine learning rate schedule (with warmup).
         warmup_iters (int): T_w, the number of iterations to linearly warm-up
             the learning rate.
-        cosine_cycle_iters (int): T_c, the number of cosine annealing iterations.
+        cosine_cycle_iters (int): T_c, the  TOTAL number of cosine annealing iterations.
 
     Returns:
         Learning rate at the given iteration under the specified schedule.
     """
-    raise NotImplementedError
+    if it < warmup_iters:
+        # Linear warmup from 0 to max_learning_rate
+        return max_learning_rate * it / warmup_iters
+    else:
+        progress = min(1.0, (it - warmup_iters) / (cosine_cycle_iters  -  warmup_iters))
+        return min_learning_rate + 0.5 * (max_learning_rate - min_learning_rate) * (1 + math.cos(math.pi * progress))
 
 
 def run_save_checkpoint(
