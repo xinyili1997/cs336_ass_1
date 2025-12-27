@@ -90,21 +90,20 @@ class SwiGLU(torch.nn.Module):
         super().__init__()
         self.d_model_ = d_model
         self.d_ff_ = d_ff
-        assert(w1_weight.shape == (d_ff, d_model))
-        assert(w2_weight.shape == (d_model, d_ff))
-        assert(w3_weight.shape == (d_ff, d_model))
+        assert w1_weight.shape == (d_ff, d_model)
+        assert w2_weight.shape == (d_model, d_ff)
+        assert w3_weight.shape == (d_ff, d_model)
         self.w1_weight_ = torch.nn.Parameter(w1_weight)
         self.w2_weight_ = torch.nn.Parameter(w2_weight)
         self.w3_weight_ = torch.nn.Parameter(w3_weight)
 
     def forward(self, in_features):
         # in_features [...d_model]
-        assert(in_features.shape[-1] == self.d_model_)
-        w1_x = in_features @ self.w1_weight_.T # [...d_ff]
-        silu_w1_x = w1_x * torch.sigmoid(w1_x) # [...d_ff]
-        w3_x = in_features @ self.w3_weight_.T # [...d_ff]
-        return  (silu_w1_x * w3_x) @self.w2_weight_.T
-
+        assert in_features.shape[-1] == self.d_model_
+        w1_x = in_features @ self.w1_weight_.T  # [...d_ff]
+        silu_w1_x = w1_x * torch.sigmoid(w1_x)  # [...d_ff]
+        w3_x = in_features @ self.w3_weight_.T  # [...d_ff]
+        return (silu_w1_x * w3_x) @ self.w2_weight_.T
 
 
 def run_swiglu(
@@ -137,7 +136,7 @@ def run_swiglu(
     # swiglu.w2.weight.data = w2_weight
     # swiglu.w3.weight.data = w3_weight
     swiglu = SwiGLU(d_model, d_ff, w1_weight, w2_weight, w3_weight)
-    return swiglu(in_features)
+    return swiglu.forward(in_features)
 
 
 def run_scaled_dot_product_attention(
@@ -233,6 +232,11 @@ def run_multihead_self_attention_with_rope(
         implementation with the given QKV projection weights and input features.
     """
     raise NotImplementedError
+
+
+class ROPE(torch.nn.Module):
+    def __init__(self, theta: float, d_k: int, max_seq_len: int, device: torch.device | None = None) -> None:
+        super().__init__()
 
 
 def run_rope(
@@ -475,7 +479,7 @@ def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
         Float[Tensor,"..."]: of with the same shape as `in_features` with the output of applying
         SiLU to each element.
     """
-    return in_features / ( 1 + torch.exp(-in_features))
+    return in_features / (1 + torch.exp(-in_features))
 
 
 def run_get_batch(
