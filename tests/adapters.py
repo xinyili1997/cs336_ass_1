@@ -157,7 +157,13 @@ def run_scaled_dot_product_attention(
     Returns:
         Float[Tensor, " ... queries d_v"]: Output of SDPA
     """
-    raise NotImplementedError
+    d_k = Q.shape[-1]
+    # for tensor with shape (..., d_k, d_k), multiply the last two dimensions and 
+    # the before dimensions must match
+    QK = Q @ K.mT # transpose last two dimensions of K
+    pre_softmax = QK/math.sqrt(d_k)
+    pre_softmax = torch.where(mask, pre_softmax, float('-inf'))
+    return run_softmax(pre_softmax, dim=-1) @ V
 
 
 def run_multihead_self_attention(
